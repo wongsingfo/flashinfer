@@ -504,19 +504,22 @@ struct Variant {
 };
 
 template <int RowsPerGroup>
-void run_workload(Workload const& workload, cudaDeviceProp const& properties, int warmup,
-                  int pairs) {
+void run_workload(Workload const& workload, cudaDeviceProp const& properties, int warmup, int pairs,
+                  int grid_active_ctas_per_sm_override) {
   int const output_dim = workload.inner_dim / 2;
   int const grid_x = output_dim / 128;
   int const logical_grid_y =
       std::min(8192, (workload.num_tokens + RowsPerGroup - 1) / RowsPerGroup * workload.top_k);
 
-  int active_ctas_per_sm = 0;
+  int kernel_active_ctas_per_sm = 0;
   CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &active_ctas_per_sm, activation_compact<RowsPerGroup>, kThreads, 0));
-  if (active_ctas_per_sm <= 0) {
+      &kernel_active_ctas_per_sm, activation_compact<RowsPerGroup>, kThreads, 0));
+  if (kernel_active_ctas_per_sm <= 0) {
     throw std::runtime_error("Kernel occupancy query returned no resident CTAs");
   }
+  int const grid_active_ctas_per_sm = grid_active_ctas_per_sm_override > 0
+                                          ? grid_active_ctas_per_sm_override
+                                          : kernel_active_ctas_per_sm;
 
   Fp8* device_input = nullptr;
   Fp8* device_output = nullptr;
@@ -558,7 +561,7 @@ void run_workload(Workload const& workload, cudaDeviceProp const& properties, in
   for (int resident_grid_rounds : kResidentGridRounds) {
     variants.push_back({"rounds-" + std::to_string(resident_grid_rounds), resident_grid_rounds,
                         compute_grid_y(grid_x, logical_grid_y, properties.multiProcessorCount,
-                                       active_ctas_per_sm, resident_grid_rounds)});
+                                       grid_active_ctas_per_sm, resident_grid_rounds)});
   }
 
   auto launch = [&](int grid_y) {
@@ -609,8 +612,10 @@ void run_workload(Workload const& workload, cudaDeviceProp const& properties, in
             << " tile_tokens=" << workload.tile_tokens << '\n';
   std::cout << "KERNEL rows_per_group=" << RowsPerGroup << " threads=" << kThreads
             << " regs=" << attributes.numRegs << " static_smem=" << attributes.sharedSizeBytes
-            << " active_ctas_per_sm=" << active_ctas_per_sm
-            << " resident_ctas=" << properties.multiProcessorCount * active_ctas_per_sm << '\n';
+            << " kernel_active_ctas_per_sm=" << kernel_active_ctas_per_sm
+            << " grid_active_ctas_per_sm=" << grid_active_ctas_per_sm
+            << " resident_ctas=" << properties.multiProcessorCount * grid_active_ctas_per_sm
+            << '\n';
   for (Variant const& variant : variants) {
     double const cta_waves =
         static_cast<double>(grid_x) * variant.grid_y / properties.multiProcessorCount;
@@ -677,6 +682,7 @@ int main(int argc, char** argv) try {
   int num_tokens = 0;
   int warmup = 20;
   int pairs = 200;
+  int grid_active_ctas_per_sm = 0;
   for (int index = 1; index < argc; ++index) {
     std::string const argument = argv[index];
     if (argument == "--sample-dir" && index + 1 < argc) {
@@ -687,14 +693,17 @@ int main(int argc, char** argv) try {
       warmup = std::stoi(argv[++index]);
     } else if (argument == "--pairs" && index + 1 < argc) {
       pairs = std::stoi(argv[++index]);
+    } else if (argument == "--grid-active-ctas-per-sm" && index + 1 < argc) {
+      grid_active_ctas_per_sm = std::stoi(argv[++index]);
     } else {
       throw std::runtime_error(
           "Usage: activation-replay-resident-grid "
           "(--sample-dir DIR | --num-tokens N) "
-          "[--warmup N] [--pairs N]");
+          "[--warmup N] [--pairs N] [--grid-active-ctas-per-sm N]");
     }
   }
-  if ((sample_dir.empty() == (num_tokens == 0)) || warmup < 0 || pairs <= 0) {
+  if ((sample_dir.empty() == (num_tokens == 0)) || warmup < 0 || pairs <= 0 ||
+      grid_active_ctas_per_sm < 0) {
     throw std::runtime_error("Specify exactly one workload source and valid timing arguments");
   }
 
@@ -725,11 +734,11 @@ int main(int argc, char** argv) try {
   }
 
   if (rows_per_group == 4) {
-    run_workload<4>(workload, properties, warmup, pairs);
+    run_workload<4>(workload, properties, warmup, pairs, grid_active_ctas_per_sm);
   } else if (rows_per_group == 2) {
-    run_workload<2>(workload, properties, warmup, pairs);
+    run_workload<2>(workload, properties, warmup, pairs, grid_active_ctas_per_sm);
   } else {
-    run_workload<1>(workload, properties, warmup, pairs);
+    run_workload<1>(workload, properties, warmup, pairs, grid_active_ctas_per_sm);
   }
   return 0;
 } catch (std::exception const& error) {
