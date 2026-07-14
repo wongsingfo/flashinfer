@@ -4,6 +4,7 @@
 // The captured production point additionally checks the default four-resident-grid
 // launch against every valid FP8 output byte and FP32 output-scale value.
 
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <cutlass/array.h>
 #include <cutlass/numeric_types.h>
@@ -46,12 +47,39 @@ constexpr std::array<int, 5> kResidentGridRounds{1, 2, 4, 6, 8};
     }                                                                                    \
   } while (false)
 
+#define CU_CHECK(call)                                                                \
+  do {                                                                                \
+    CUresult const status_ = (call);                                                  \
+    if (status_ != CUDA_SUCCESS) {                                                    \
+      char const* name_ = nullptr;                                                    \
+      cuGetErrorName(status_, &name_);                                                \
+      throw std::runtime_error(std::string(#call) + ": " +                            \
+                               (name_ == nullptr ? std::to_string(status_) : name_)); \
+    }                                                                                 \
+  } while (false)
+
 struct Params {
   Fp8 const* input;
   Fp8* output;
   float const* input_scales;
   float* output_scales;
   int32_t inner_dim;
+  int32_t const* total_padded;
+  int32_t const* cta_mn_limits;
+  int32_t const* num_non_exiting_ctas;
+  int32_t tile_tokens;
+};
+
+// Matches moe::dev::activation::KernelParams<Fp8, RowsPerGroup, false> exactly.
+struct ProductionParams {
+  Fp8 const* input;
+  Fp8* output;
+  float* input_scales;
+  float* output_scales;
+  int32_t inner_dim;
+  int32_t num_tokens;
+  int32_t top_k;
+  int32_t* expanded_to_permuted;
   int32_t const* total_padded;
   int32_t const* cta_mn_limits;
   int32_t const* num_non_exiting_ctas;
@@ -505,19 +533,44 @@ struct Variant {
 
 template <int RowsPerGroup>
 void run_workload(Workload const& workload, cudaDeviceProp const& properties, int warmup, int pairs,
-                  int grid_active_ctas_per_sm_override) {
+                  int grid_active_ctas_per_sm_override, std::string const& production_cubin) {
   int const output_dim = workload.inner_dim / 2;
   int const grid_x = output_dim / 128;
   int const logical_grid_y =
       std::min(8192, (workload.num_tokens + RowsPerGroup - 1) / RowsPerGroup * workload.top_k);
 
+  bool const use_production_cubin = !production_cubin.empty();
+  CUmodule production_module{};
+  CUfunction production_function{};
   int kernel_active_ctas_per_sm = 0;
-  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &kernel_active_ctas_per_sm, activation_compact<RowsPerGroup>, kThreads, 0));
+  int kernel_num_regs = 0;
+  int kernel_static_smem = 0;
+  if (use_production_cubin) {
+    CU_CHECK(cuInit(0));
+    CU_CHECK(cuModuleLoad(&production_module, production_cubin.c_str()));
+    std::string const kernel_name =
+        "_ZN3moe3dev10activation24activationDeepSeekKernelINS1_12KernelParamsIN7cutlass12"
+        "float_e4m3_tELi" +
+        std::to_string(RowsPerGroup) + "ELb0EEEEEvT_";
+    CU_CHECK(cuModuleGetFunction(&production_function, production_module, kernel_name.c_str()));
+    CU_CHECK(cuOccupancyMaxActiveBlocksPerMultiprocessor(&kernel_active_ctas_per_sm,
+                                                         production_function, kThreads, 0));
+    CU_CHECK(cuFuncGetAttribute(&kernel_num_regs, CU_FUNC_ATTRIBUTE_NUM_REGS, production_function));
+    CU_CHECK(cuFuncGetAttribute(&kernel_static_smem, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
+                                production_function));
+  } else {
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &kernel_active_ctas_per_sm, activation_compact<RowsPerGroup>, kThreads, 0));
+    cudaFuncAttributes attributes{};
+    CUDA_CHECK(cudaFuncGetAttributes(&attributes, activation_compact<RowsPerGroup>));
+    kernel_num_regs = attributes.numRegs;
+    kernel_static_smem = attributes.sharedSizeBytes;
+  }
   if (kernel_active_ctas_per_sm <= 0) {
     throw std::runtime_error("Kernel occupancy query returned no resident CTAs");
   }
-  int const grid_active_ctas_per_sm = grid_active_ctas_per_sm_override > 0
+  int const grid_active_ctas_per_sm = use_production_cubin ? kernel_active_ctas_per_sm
+                                      : grid_active_ctas_per_sm_override > 0
                                           ? grid_active_ctas_per_sm_override
                                           : kernel_active_ctas_per_sm;
 
@@ -555,6 +608,10 @@ void run_workload(Workload const& workload, cudaDeviceProp const& properties, in
   Params const params{device_input,         device_output,      device_input_scales,
                       device_output_scales, workload.inner_dim, device_total_padded,
                       device_mn_limits,     device_active_ctas, workload.tile_tokens};
+  ProductionParams const production_params{
+      device_input,        device_output,       device_input_scales, device_output_scales,
+      workload.inner_dim,  workload.num_tokens, workload.top_k,      nullptr,
+      device_total_padded, device_mn_limits,    device_active_ctas,  workload.tile_tokens};
 
   std::vector<Variant> variants;
   variants.push_back({"logical", 0, logical_grid_y});
@@ -565,8 +622,14 @@ void run_workload(Workload const& workload, cudaDeviceProp const& properties, in
   }
 
   auto launch = [&](int grid_y) {
-    activation_compact<RowsPerGroup><<<dim3(grid_x, grid_y, 1), kThreads>>>(params);
-    CUDA_CHECK(cudaGetLastError());
+    if (use_production_cubin) {
+      void* arguments[] = {const_cast<ProductionParams*>(&production_params)};
+      CU_CHECK(cuLaunchKernel(production_function, grid_x, grid_y, 1, kThreads, 1, 1, 0, nullptr,
+                              arguments, nullptr));
+    } else {
+      activation_compact<RowsPerGroup><<<dim3(grid_x, grid_y, 1), kThreads>>>(params);
+      CUDA_CHECK(cudaGetLastError());
+    }
   };
 
   if (!workload.reference_output.empty()) {
@@ -601,8 +664,6 @@ void run_workload(Workload const& workload, cudaDeviceProp const& properties, in
     }
   }
 
-  cudaFuncAttributes attributes{};
-  CUDA_CHECK(cudaFuncGetAttributes(&attributes, activation_compact<RowsPerGroup>));
   int const total_groups = workload.active_ctas * workload.tile_tokens / RowsPerGroup;
   std::cout << "SHAPE source=" << workload.source << " num_tokens=" << workload.num_tokens
             << " top_k=" << workload.top_k << " inner_dim=" << workload.inner_dim
@@ -610,8 +671,9 @@ void run_workload(Workload const& workload, cudaDeviceProp const& properties, in
             << " valid_rows=" << workload.valid_rows.size()
             << " active_routing_ctas=" << workload.active_ctas << " total_groups=" << total_groups
             << " tile_tokens=" << workload.tile_tokens << '\n';
-  std::cout << "KERNEL rows_per_group=" << RowsPerGroup << " threads=" << kThreads
-            << " regs=" << attributes.numRegs << " static_smem=" << attributes.sharedSizeBytes
+  std::cout << "KERNEL mode=" << (use_production_cubin ? "production-cubin" : "standalone")
+            << " rows_per_group=" << RowsPerGroup << " threads=" << kThreads
+            << " regs=" << kernel_num_regs << " static_smem=" << kernel_static_smem
             << " kernel_active_ctas_per_sm=" << kernel_active_ctas_per_sm
             << " grid_active_ctas_per_sm=" << grid_active_ctas_per_sm
             << " resident_ctas=" << properties.multiProcessorCount * grid_active_ctas_per_sm
@@ -673,6 +735,9 @@ void run_workload(Workload const& workload, cudaDeviceProp const& properties, in
   CUDA_CHECK(cudaFree(device_total_padded));
   CUDA_CHECK(cudaFree(device_mn_limits));
   CUDA_CHECK(cudaFree(device_active_ctas));
+  if (use_production_cubin) {
+    CU_CHECK(cuModuleUnload(production_module));
+  }
 }
 
 }  // namespace
@@ -683,6 +748,7 @@ int main(int argc, char** argv) try {
   int warmup = 20;
   int pairs = 200;
   int grid_active_ctas_per_sm = 0;
+  std::string production_cubin;
   for (int index = 1; index < argc; ++index) {
     std::string const argument = argv[index];
     if (argument == "--sample-dir" && index + 1 < argc) {
@@ -695,11 +761,14 @@ int main(int argc, char** argv) try {
       pairs = std::stoi(argv[++index]);
     } else if (argument == "--grid-active-ctas-per-sm" && index + 1 < argc) {
       grid_active_ctas_per_sm = std::stoi(argv[++index]);
+    } else if (argument == "--production-cubin" && index + 1 < argc) {
+      production_cubin = argv[++index];
     } else {
       throw std::runtime_error(
           "Usage: activation-replay-resident-grid "
           "(--sample-dir DIR | --num-tokens N) "
-          "[--warmup N] [--pairs N] [--grid-active-ctas-per-sm N]");
+          "[--warmup N] [--pairs N] [--grid-active-ctas-per-sm N] "
+          "[--production-cubin PATH]");
     }
   }
   if ((sample_dir.empty() == (num_tokens == 0)) || warmup < 0 || pairs <= 0 ||
@@ -708,6 +777,7 @@ int main(int argc, char** argv) try {
   }
 
   CUDA_CHECK(cudaSetDevice(0));
+  CUDA_CHECK(cudaFree(nullptr));
   cudaDeviceProp properties{};
   CUDA_CHECK(cudaGetDeviceProperties(&properties, 0));
   if (properties.major != 10) {
@@ -734,11 +804,11 @@ int main(int argc, char** argv) try {
   }
 
   if (rows_per_group == 4) {
-    run_workload<4>(workload, properties, warmup, pairs, grid_active_ctas_per_sm);
+    run_workload<4>(workload, properties, warmup, pairs, grid_active_ctas_per_sm, production_cubin);
   } else if (rows_per_group == 2) {
-    run_workload<2>(workload, properties, warmup, pairs, grid_active_ctas_per_sm);
+    run_workload<2>(workload, properties, warmup, pairs, grid_active_ctas_per_sm, production_cubin);
   } else {
-    run_workload<1>(workload, properties, warmup, pairs, grid_active_ctas_per_sm);
+    run_workload<1>(workload, properties, warmup, pairs, grid_active_ctas_per_sm, production_cubin);
   }
   return 0;
 } catch (std::exception const& error) {
